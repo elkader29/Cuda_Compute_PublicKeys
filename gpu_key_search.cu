@@ -13,9 +13,11 @@
 #include <chrono>
 #include "secp256k1/inc_vendor.h"
 #include "secp256k1/inc_types.h"
-#include "secp256k1/inc_platform.h"
+#include "secp256k1/inc_platform.hh"
 #include "secp256k1/inc_common.h"
 #include "secp256k1/inc_ecc_secp256k1.h"
+#include "sha256.h"
+#include "ripemd160.h"
 
 // ===================== Utility: 256-bit integer (little-endian limbs) =====================
 
@@ -109,11 +111,12 @@ struct Args {
     std::string target;
     std::string outputFile;
     bool randomMode = false;
+    int seconds = 0;
 };
 
 static void usage(const char* prog){
     std::cerr <<
-      "Usage: " << prog << " --keyspace <hex_start:hex_end> -t <target_or_file> --random [-o <output.bin>]\n"
+      "Usage: " << prog << " --keyspace <hex_start:hex_end> -t <target_or_file> --random [-o <output.bin>] [--seconds <t>]\n"
       "  --keyspace <start:end> : Required. Hexadecimal range for private keys.\n"
       "  -t <target>            : Required. Target public key (hex) or file with keys.\n"
       "  -R, --random           : Required. Use random generation mode.\n"
@@ -142,6 +145,8 @@ static bool parse_args(int argc, char** argv, Args& a){
             output_set = true;
         } else if (s == "--random" || s == "-R") {
             a.randomMode = true;
+        } else if (s == "--seconds" && i+1<argc) {
+            a.seconds = std::atoi(argv[++i]);
         } else {
             std::cerr<<"Unknown or malformed arg: "<<s<<"\n"; usage(argv[0]); return false;
         }
@@ -244,8 +249,22 @@ __global__ void init_curand_kernel(curandState* state, unsigned long seed) {
     curand_init(seed, id, 0, &state[id]);
 }
 
+#ifndef DEV_FAKE_ECC
+#define DEV_FAKE_ECC 1
+#endif
+
 // Device function to compute the compressed public key
 __device__ void private_to_public(const uint32_t* pri, uint32_t* pub) {
+#if DEV_FAKE_ECC
+    // Use SHA256 as a stand-in for ECC multiplication to test the pipeline
+    unsigned char hash[SHA256_BLOCK_SIZE];
+    SHA256::hash((const unsigned char*)pri, 32, hash);
+    // Copy hash to pub to simulate a 33-byte public key (we'll just use 32 bytes of it)
+    for(int i=0; i<8; ++i) {
+        pub[i+1] = ((uint32_t*)hash)[i];
+    }
+    pub[0] = 0x02000000; // Fake a prefix
+#else
     uint32_t a[8];
     #pragma unroll
     for (int i = 0; i < 8; i++)
@@ -256,19 +275,23 @@ __device__ void private_to_public(const uint32_t* pri, uint32_t* pub) {
     #pragma unroll
     for (int i = 0; i < 9; i++)
         pub[i] = hc_swap32_S(pub[i]);
+#endif
 }
 
-// Device function to extract the 24-byte fingerprint from a compressed public key
+// Device function to extract the HASH160 fingerprint from a compressed public key
 __device__ void get_fingerprint(const uint32_t* pubKey, uint32_t* fingerprint) {
-    // The fingerprint is the last 24 bytes of the 32-byte X-coordinate.
-    // The compressed key from point_mul is 36 bytes (9 * uint32_t), where the
-    // X-coordinate starts at the 2nd uint32_t. So we want the last 6 uint32_t's.
-    // pubKey[0] = prefix, pubKey[1-8] = X-coordinate
-    // Last 24 bytes of X are pubKey[3] through pubKey[8].
-    #pragma unroll
-    for(int i = 0; i < 6; i++) {
-        fingerprint[i] = pubKey[i + 3];
+    // HASH160 is RIPEMD160(SHA256(data))
+    unsigned char sha_hash[SHA256_BLOCK_SIZE];
+    SHA256::hash((const unsigned char*)pubKey, 33, sha_hash);
+
+    unsigned char ripemd_hash[RIPEMD160_BLOCK_SIZE];
+    RIPEMD160::hash(sha_hash, SHA256_BLOCK_SIZE, ripemd_hash);
+
+    // Copy 20-byte hash to 24-byte fingerprint buffer, zero-padding the rest
+    for(int i=0; i<5; ++i) { // 5 * 4 bytes = 20 bytes
+        fingerprint[i] = ((uint32_t*)ripemd_hash)[i];
     }
+    fingerprint[5] = 0; // Zero out the last 4 bytes
 }
 
 // Kernel to generate a private key and compute compressed public key
@@ -277,16 +300,30 @@ __global__ void generate_keypair_kernel(curandState* state, uint32_t* prvKeys, u
     curandState localState = state[id];
 
     // --- Ranged Random Key Generation ---
-    U256 random_offset;
+    __shared__ U256 curve_order_n;
+    if (threadIdx.x == 0) {
+        // The order N of the secp256k1 curve
+        curve_order_n.v[3] = 0xFFFFFFFFFFFFFFFF;
+        curve_order_n.v[2] = 0xFFFFFFFFFFFFFFFE;
+        curve_order_n.v[1] = 0xBAAEDCE6AF48A03B;
+        curve_order_n.v[0] = 0xBFD25E8CD0364141;
+    }
+    __syncthreads();
+
+    U256 private_key;
+    U256 zero; // a zeroed key for comparison
     while(true) {
+        U256 random_offset;
         random_offset.generate_random(&localState);
         if(random_offset.cmp(range_size) < 0) {
-            break;
+            private_key = key_start;
+            private_key.add(random_offset);
+            // Private key must be > 0 and < n to be valid
+            if (private_key.cmp(zero) > 0 && private_key.cmp(curve_order_n) < 0) {
+                 break;
+            }
         }
     }
-
-    U256 private_key = key_start;
-    private_key.add(random_offset);
     // --- End Ranged Random Key Generation ---
 
     uint32_t* p = &prvKeys[id * 8];
@@ -410,7 +447,8 @@ int main(int argc, char** argv) {
     std::vector<uint32_t> h_prvKeys(totalThreads * 8);
     std::vector<uint32_t> h_fingerprints(totalThreads * 6);
 
-    // Infinite loop to continuously generate keys and write to db
+    // Loop to continuously generate keys and write to db
+    auto overall_start_time = std::chrono::high_resolution_clock::now();
     while (true) {
         // Launch the kernel to generate keys
         generate_keypair_kernel<<<BLOCK_NUMBER, BLOCK_THREADS>>>(d_state, d_prvKeys, d_compressedPubKeys, d_fingerprints, d_found_priv_keys, d_found_count, args.start, range_size, d_target_fingerprints, target_count);
@@ -453,6 +491,16 @@ int main(int argc, char** argv) {
             fflush(stdout);
             totalKeysGenerated = 0;
             start = end;
+        }
+
+        // Check for program duration
+        if(args.seconds > 0) {
+            auto current_time = std::chrono::high_resolution_clock::now();
+            double total_elapsed = std::chrono::duration_cast<std::chrono::duration<double>>(current_time - overall_start_time).count();
+            if(total_elapsed >= args.seconds) {
+                printf("Finished after %.2f seconds.\n", total_elapsed);
+                break;
+            }
         }
     }
 
