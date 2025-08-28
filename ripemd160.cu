@@ -355,11 +355,3 @@ __device__ void RIPEMD160::final(unsigned char *digest)
 		WRITE_LE32(digest + i * 4, m_h[i]);
 	}
 }
-
-__device__ void RIPEMD160::hash(const unsigned char* data, size_t len, unsigned char* digest)
-{
-    RIPEMD160 ctx;
-    new (&ctx) RIPEMD160();
-    ctx.update(data, len);
-    ctx.final(digest);
-}

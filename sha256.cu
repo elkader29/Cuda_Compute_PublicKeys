@@ -154,13 +154,6 @@ __device__ void SHA256::final(unsigned char *digest)
 	}
 }
 
-__device__ void SHA256::hash(const unsigned char* data, size_t len, unsigned char* digest)
-{
-    SHA256 ctx;
-    ctx.update(data, len);
-    ctx.final(digest);
-}
-
 // Wrapper functions for C-style interface
 __device__ void sha256_init(SHA256* ctx) {
     new (ctx) SHA256();

@@ -41,4 +41,13 @@ __device__ void sha256_init(SHA256* ctx);
 __device__ void sha256_update(SHA256* ctx, const BYTE* data, size_t len);
 __device__ void sha256_final(SHA256* ctx, BYTE* hash);
 
+// Must be in header for separate compilation to work
+__device__ inline void SHA256::hash(const unsigned char* data, size_t len, unsigned char* digest)
+{
+    SHA256 ctx;
+    new (&ctx) SHA256();
+    ctx.update(data, len);
+    ctx.final(digest);
+}
+
 #endif   // SHA256_H

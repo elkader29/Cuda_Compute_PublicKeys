@@ -25,8 +25,6 @@ struct U256 {
     // Little-endian limbs: v[0] is least-significant 64 bits
     uint64_t v[4];
 
-    __host__ __device__ U256() { v[0]=v[1]=v[2]=v[3]=0; }
-
     static U256 from_hex(const std::string& hex) {
         std::string s = hex;
         if (s.rfind("0x",0)==0 || s.rfind("0X",0)==0) s = s.substr(2);
@@ -311,7 +309,7 @@ __global__ void generate_keypair_kernel(curandState* state, uint32_t* prvKeys, u
     __syncthreads();
 
     U256 private_key;
-    U256 zero; // a zeroed key for comparison
+    U256 zero = {0,0,0,0}; // a zeroed key for comparison
     while(true) {
         U256 random_offset;
         random_offset.generate_random(&localState);

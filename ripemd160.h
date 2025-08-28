@@ -36,4 +36,13 @@ public:
 	__device__ static void hash(const unsigned char* data, size_t len, unsigned char* digest);
 };
 
+// Must be in header for separate compilation to work
+__device__ inline void RIPEMD160::hash(const unsigned char* data, size_t len, unsigned char* digest)
+{
+    RIPEMD160 ctx;
+    new (&ctx) RIPEMD160();
+    ctx.update(data, len);
+    ctx.final(digest);
+}
+
 #endif   // RIPEMD160_H
