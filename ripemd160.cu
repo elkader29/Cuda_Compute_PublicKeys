@@ -337,10 +337,8 @@ __device__ void RIPEMD160::final(unsigned char *digest)
 {
 	unsigned int block_nb;
 	unsigned int pm_len;
-	unsigned int len_b;
 
 	block_nb = (1 + ((64 - 9) < (m_len % 64)));
-	len_b = (m_tot_len + m_len) << 3;
 	pm_len = block_nb << 6;
 
 	for(unsigned int idx = m_len; idx < pm_len; ++idx)
