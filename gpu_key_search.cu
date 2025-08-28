@@ -9,6 +9,8 @@
 #include <vector>
 #include <array>
 #include <algorithm>
+#include <cinttypes>
+#include <random>
 #include <curand_kernel.h>
 #include <chrono>
 #include "secp256k1/inc_vendor.h"
@@ -110,15 +112,18 @@ struct Args {
     std::string outputFile;
     bool randomMode = false;
     int seconds = 0;
+    uint64_t batch_size = 1 << 20; // Default 1M
 };
 
 static void usage(const char* prog){
     std::cerr <<
-      "Usage: " << prog << " --keyspace <hex_start:hex_end> -t <target_or_file> --random [-o <output.bin>] [--seconds <t>]\n"
+      "Usage: " << prog << " --keyspace <hex_start:hex_end> -t <target_or_file> --random [-o <output.bin>] [--seconds <t>] [--batch-size <N>]\n"
       "  --keyspace <start:end> : Required. Hexadecimal range for private keys.\n"
       "  -t <target>            : Required. Target public key (hex) or file with keys.\n"
       "  -R, --random           : Required. Use random generation mode.\n"
-      "  -o <file>              : Required. File to write private keys and fingerprints to.\n";
+      "  -o <file>              : Required. File to write private keys and fingerprints to.\n"
+      "  --seconds <t>          : Optional. Exit after t seconds. Default is infinite.\n"
+      "  --batch-size <N>       : Optional. Keys per batch. Default is 1048576.\n";
 }
 
 static bool parse_args(int argc, char** argv, Args& a){
@@ -145,6 +150,8 @@ static bool parse_args(int argc, char** argv, Args& a){
             a.randomMode = true;
         } else if (s == "--seconds" && i+1<argc) {
             a.seconds = std::atoi(argv[++i]);
+        } else if (s == "--batch-size" && i+1<argc) {
+            a.batch_size = std::stoull(argv[++i]);
         } else {
             std::cerr<<"Unknown or malformed arg: "<<s<<"\n"; usage(argv[0]); return false;
         }
@@ -158,6 +165,47 @@ static bool parse_args(int argc, char** argv, Args& a){
     if (a.start.cmp(a.end) > 0){ std::cerr<<"Error: start of keyspace is greater than end.\n"; return false; }
     return true;
 }
+
+// pick a random base inside [start, end-count+1]
+static U256 random_base_in_range(const U256& start, const U256& end, uint64_t count) {
+    U256 range_size;
+    range_size.v[3] = end.v[3]; range_size.v[2] = end.v[2]; range_size.v[1] = end.v[1]; range_size.v[0] = end.v[0];
+    range_size.sub(start);
+
+    U256 count_u256;
+    count_u256.v[0] = count;
+    range_size.sub(count_u256);
+
+    U256 one;
+    one.v[0] = 1;
+    range_size.add(one);
+
+    // Now range_size is the number of possible start keys
+
+    std::random_device rd;
+    std::mt19937_64 gen(rd());
+
+    U256 random_add;
+    while(true) {
+        uint64_t r1 = gen();
+        uint64_t r2 = gen();
+        uint64_t r3 = gen();
+        uint64_t r4 = gen();
+        random_add.v[0] = r1;
+        random_add.v[1] = r2;
+        random_add.v[2] = r3;
+        random_add.v[3] = r4;
+
+        if(random_add.cmp(range_size) < 0) {
+            break;
+        }
+    }
+
+    U256 base_key = start;
+    base_key.add(random_add);
+    return base_key;
+}
+
 
 // ===================== Target Loading =====================
 
@@ -242,11 +290,6 @@ unsigned int BLOCK_NUMBER = 0; // Set based on GPU properties dynamically
     } \
 }
 
-__global__ void init_curand_kernel(curandState* state, unsigned long seed) {
-    int id = threadIdx.x + blockIdx.x * blockDim.x;
-    curand_init(seed, id, 0, &state[id]);
-}
-
 #ifndef DEV_FAKE_ECC
 #define DEV_FAKE_ECC 1
 #endif
@@ -293,14 +336,18 @@ __device__ void get_fingerprint(const uint32_t* pubKey, uint32_t* fingerprint) {
 }
 
 // Kernel to generate a private key and compute compressed public key
-__global__ void generate_keypair_kernel(curandState* state, uint32_t* prvKeys, uint32_t* compressedPubKeys, uint32_t* fingerprints, uint32_t* found_priv_keys, unsigned int* found_count, U256 key_start, U256 range_size, const uint32_t* target_fingerprints, unsigned int target_count) {
-    int id = threadIdx.x + blockIdx.x * blockDim.x;
-    curandState localState = state[id];
+__global__ void generate_keypair_kernel(uint32_t* prvKeys, uint32_t* compressedPubKeys, uint32_t* fingerprints, uint32_t* found_priv_keys, unsigned int* found_count, U256 base_key, const uint32_t* target_fingerprints, unsigned int target_count) {
+    uint64_t id = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
 
-    // --- Ranged Random Key Generation ---
+    // --- Sequential Key Generation ---
+    U256 offset = {id, 0, 0, 0};
+    U256 private_key = base_key;
+    private_key.add(offset);
+    // --- End Sequential Key Generation ---
+
+    // We still need to check if the generated key is valid for the curve
     __shared__ U256 curve_order_n;
     if (threadIdx.x == 0) {
-        // The order N of the secp256k1 curve
         curve_order_n.v[3] = 0xFFFFFFFFFFFFFFFF;
         curve_order_n.v[2] = 0xFFFFFFFFFFFFFFFE;
         curve_order_n.v[1] = 0xBAAEDCE6AF48A03B;
@@ -308,21 +355,10 @@ __global__ void generate_keypair_kernel(curandState* state, uint32_t* prvKeys, u
     }
     __syncthreads();
 
-    U256 private_key;
-    U256 zero = {0,0,0,0}; // a zeroed key for comparison
-    while(true) {
-        U256 random_offset;
-        random_offset.generate_random(&localState);
-        if(random_offset.cmp(range_size) < 0) {
-            private_key = key_start;
-            private_key.add(random_offset);
-            // Private key must be > 0 and < n to be valid
-            if (private_key.cmp(zero) > 0 && private_key.cmp(curve_order_n) < 0) {
-                 break;
-            }
-        }
+    U256 zero = {0,0,0,0};
+    if (private_key.cmp(zero) <= 0 || private_key.cmp(curve_order_n) >= 0) {
+        return; // Invalid key, this thread will do no work
     }
-    // --- End Ranged Random Key Generation ---
 
     uint32_t* p = &prvKeys[id * 8];
     private_key.to_priv_key_bytes(p);
@@ -372,11 +408,10 @@ int main(int argc, char** argv) {
     cudaDeviceProp props;
     cudaGetDeviceProperties(&props, 0);
 
-    if (BLOCK_NUMBER == 0) {
-        BLOCK_NUMBER = props.multiProcessorCount * 4;  // Set a high number of blocks to keep the GPU busy
-    }
+    unsigned int block_size = 256;
+    unsigned int grid_size = (args.batch_size + block_size - 1) / block_size;
 
-    fprintf(stderr, "[!] %s (%2d procs | Blocks: %d | Threads: %d)\n", props.name, props.multiProcessorCount, BLOCK_NUMBER, BLOCK_THREADS);
+    fprintf(stderr, "[!] %s (%2d procs | Batch Size: %" PRIu64 " | Grid: %d | Threads: %d)\n", props.name, props.multiProcessorCount, args.batch_size, grid_size, block_size);
 
     secp256k1_t basepoint;
     set_precomputed_basepoint_g(&basepoint);
@@ -416,18 +451,12 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    curandState* d_state;
     uint32_t* d_prvKeys;
     uint32_t* d_compressedPubKeys;
     uint32_t* d_fingerprints;
-    size_t totalThreads = BLOCK_NUMBER * BLOCK_THREADS;
-    cudaMalloc((void**)&d_prvKeys, 8 * totalThreads * sizeof(uint32_t));
-    cudaMalloc((void**)&d_compressedPubKeys, 9 * totalThreads * sizeof(uint32_t));
-    cudaMalloc((void**)&d_fingerprints, 6 * totalThreads * sizeof(uint32_t)); // 24 bytes per fingerprint
-    cudaMalloc((void**)&d_state, totalThreads * sizeof(curandState));
-    cudaCheckError();
-
-    init_curand_kernel<<<BLOCK_NUMBER, BLOCK_THREADS>>>(d_state, time(0));
+    cudaMalloc((void**)&d_prvKeys, 8 * args.batch_size * sizeof(uint32_t));
+    cudaMalloc((void**)&d_compressedPubKeys, 9 * args.batch_size * sizeof(uint32_t));
+    cudaMalloc((void**)&d_fingerprints, 6 * args.batch_size * sizeof(uint32_t)); // 24 bytes per fingerprint
     cudaCheckError();
 
     // Variables for performance measurement
@@ -442,14 +471,15 @@ int main(int argc, char** argv) {
     }
 
     // Host buffers
-    std::vector<uint32_t> h_prvKeys(totalThreads * 8);
-    std::vector<uint32_t> h_fingerprints(totalThreads * 6);
+    std::vector<uint32_t> h_prvKeys(args.batch_size * 8);
+    std::vector<uint32_t> h_fingerprints(args.batch_size * 6);
 
     // Loop to continuously generate keys and write to db
     auto overall_start_time = std::chrono::high_resolution_clock::now();
     while (true) {
+        U256 base_key = random_base_in_range(args.start, args.end, args.batch_size);
         // Launch the kernel to generate keys
-        generate_keypair_kernel<<<BLOCK_NUMBER, BLOCK_THREADS>>>(d_state, d_prvKeys, d_compressedPubKeys, d_fingerprints, d_found_priv_keys, d_found_count, args.start, range_size, d_target_fingerprints, target_count);
+        generate_keypair_kernel<<<grid_size, block_size>>>(d_prvKeys, d_compressedPubKeys, d_fingerprints, d_found_priv_keys, d_found_count, base_key, d_target_fingerprints, target_count);
         cudaCheckError();
 
         // Copy results back to host
@@ -457,7 +487,7 @@ int main(int argc, char** argv) {
         cudaMemcpy(h_fingerprints.data(), d_fingerprints, h_fingerprints.size() * sizeof(uint32_t), cudaMemcpyDeviceToHost);
 
         // Write to database file
-        for(size_t i = 0; i < totalThreads; ++i) {
+        for(size_t i = 0; i < args.batch_size; ++i) {
             output_db_file.write(reinterpret_cast<const char*>(&h_prvKeys[i * 8]), 32); // 32-byte private key
             output_db_file.write(reinterpret_cast<const char*>(&h_fingerprints[i * 6]), 24); // 24-byte fingerprint
         }
@@ -480,7 +510,7 @@ int main(int argc, char** argv) {
             cudaMemset(d_found_count, 0, sizeof(unsigned int));
         }
 
-        totalKeysGenerated += totalThreads;
+        totalKeysGenerated += args.batch_size;
         auto end = std::chrono::high_resolution_clock::now();
         std::chrono::duration<double> elapsed = end - start;
         if(elapsed.count() > 2.0) {
@@ -506,7 +536,6 @@ int main(int argc, char** argv) {
     cudaFree(d_prvKeys);
     cudaFree(d_compressedPubKeys);
     cudaFree(d_fingerprints);
-    cudaFree(d_state);
     cudaFree(d_found_priv_keys);
     cudaFree(d_found_count);
     cudaFree(d_target_fingerprints);
